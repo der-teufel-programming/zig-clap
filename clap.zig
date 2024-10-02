@@ -13,10 +13,13 @@ const testing = std.testing;
 pub const args = @import("clap/args.zig");
 pub const parsers = @import("clap/parsers.zig");
 pub const streaming = @import("clap/streaming.zig");
+pub const ccw = @import("clap/codepoint_counting_writer.zig");
 
 test "clap" {
     testing.refAllDecls(@This());
 }
+
+pub const default_assignment_separators = "=";
 
 /// The names a `Param` can have.
 pub const Names = struct {
@@ -132,7 +135,7 @@ fn countParams(str: []const u8) usize {
     @setEvalBranchQuota(std.math.maxInt(u32));
 
     var res: usize = 0;
-    var it = mem.split(u8, str, "\n");
+    var it = mem.splitScalar(u8, str, '\n');
     while (it.next()) |line| {
         const trimmed = mem.trimLeft(u8, line, " \t");
         if (mem.startsWith(u8, trimmed, "-") or
@@ -643,6 +646,7 @@ test "Diagnostic.report" {
 pub const ParseOptions = struct {
     allocator: mem.Allocator,
     diagnostic: ?*Diagnostic = null,
+    assignment_separators: []const u8 = default_assignment_separators,
 };
 
 /// Same as `parseEx` but uses the `args.OsIterator` by default.
@@ -662,6 +666,7 @@ pub fn parse(
         // Let's reuse the arena from the `OSIterator` since we already have it.
         .allocator = arena.allocator(),
         .diagnostic = opt.diagnostic,
+        .assignment_separators = opt.assignment_separators,
     });
 
     return Result(Id, params, value_parsers){
@@ -733,6 +738,7 @@ pub fn parseEx(
         .params = params,
         .iter = iter,
         .diagnostic = opt.diagnostic,
+        .assignment_separators = opt.assignment_separators,
     };
     while (try stream.next()) |arg| {
         // TODO: We cannot use `try` inside the inline for because of a compiler bug that
@@ -761,7 +767,7 @@ pub fn parseEx(
     // fields to slices and return that.
     var result_args = Arguments(Id, params, value_parsers, .slice){};
     inline for (meta.fields(@TypeOf(arguments))) |field| {
-        if (@typeInfo(field.type) == .Struct and
+        if (@typeInfo(field.type) == .@"struct" and
             @hasDecl(field.type, "toOwnedSlice"))
         {
             const slice = try @field(arguments, field.name).toOwnedSlice(allocator);
@@ -878,7 +884,7 @@ fn deinitArgs(
         // If the multi value field is a struct, we know it is a list and should be deinited.
         // Otherwise, it is a slice that should be freed.
         switch (@typeInfo(@TypeOf(field))) {
-            .Struct => @field(arguments, longest.name).deinit(allocator),
+            .@"struct" => @field(arguments, longest.name).deinit(allocator),
             else => allocator.free(@field(arguments, longest.name)),
         }
     }
@@ -895,8 +901,15 @@ fn Arguments(
     comptime value_parsers: anytype,
     comptime multi_arg_kind: MultiArgKind,
 ) type {
-    var fields: [params.len]builtin.Type.StructField = undefined;
+    var fields_len: usize = 0;
+    for (params) |param| {
+        const longest = param.names.longest();
+        if (longest.kind == .positional)
+            continue;
+        fields_len += 1;
+    }
 
+    var fields: [fields_len]builtin.Type.StructField = undefined;
     var i: usize = 0;
     for (params) |param| {
         const longest = param.names.longest();
@@ -913,9 +926,9 @@ fn Arguments(
             },
         };
 
-        const name = longest.name[0..longest.name.len].*;
+        const name = longest.name[0..longest.name.len] ++ ""; // Adds null terminator
         fields[i] = .{
-            .name = &name,
+            .name = name,
             .type = @TypeOf(default_value),
             .default_value = @ptrCast(&default_value),
             .is_comptime = false,
@@ -924,9 +937,9 @@ fn Arguments(
         i += 1;
     }
 
-    return @Type(.{ .Struct = .{
-        .layout = .Auto,
-        .fields = fields[0..i],
+    return @Type(.{ .@"struct" = .{
+        .layout = .auto,
+        .fields = &fields,
         .decls = &.{},
         .is_tuple = false,
     } });
@@ -946,6 +959,24 @@ test "str and u64" {
         .allocator = testing.allocator,
     });
     defer res.deinit();
+}
+
+test "different assignment separators" {
+    const params = comptime parseParamsComptime(
+        \\-a, --aa <usize>...
+        \\
+    );
+
+    var iter = args.SliceIterator{
+        .args = &.{ "-a=0", "--aa=1", "-a:2", "--aa:3" },
+    };
+    var res = try parseEx(Help, &params, parsers.default, &iter, .{
+        .allocator = testing.allocator,
+        .assignment_separators = "=:",
+    });
+    defer res.deinit();
+
+    try testing.expectEqualSlices(usize, &.{ 0, 1, 2, 3 }, res.args.aa);
 }
 
 test "everything" {
@@ -1123,10 +1154,10 @@ pub fn help(
     const max_spacing = blk: {
         var res: usize = 0;
         for (params) |param| {
-            var cs = io.countingWriter(io.null_writer);
+            var cs = ccw.codepointCountingWriter(io.null_writer);
             try printParam(cs.writer(), Id, param);
-            if (res < cs.bytes_written)
-                res = @intCast(cs.bytes_written);
+            if (res < cs.codepoints_written)
+                res = @intCast(cs.codepoints_written);
         }
 
         break :blk res;
@@ -1136,22 +1167,22 @@ pub fn help(
         opt.description_indent +
         max_spacing * @intFromBool(!opt.description_on_new_line);
 
-    var first_paramter: bool = true;
+    var first_parameter: bool = true;
     for (params) |param| {
-        if (!first_paramter)
+        if (!first_parameter)
             try writer.writeByteNTimes('\n', opt.spacing_between_parameters);
 
-        first_paramter = false;
+        first_parameter = false;
         try writer.writeByteNTimes(' ', opt.indent);
 
-        var cw = io.countingWriter(writer);
+        var cw = ccw.codepointCountingWriter(writer);
         try printParam(cw.writer(), Id, param);
 
         const Writer = DescriptionWriter(@TypeOf(writer));
         var description_writer = Writer{
             .underlying_writer = writer,
             .indentation = description_indentation,
-            .printed_chars = @intCast(cw.bytes_written),
+            .printed_chars = @intCast(cw.codepoints_written),
             .max_width = opt.max_width,
         };
 
@@ -1163,7 +1194,7 @@ pub fn help(
 
             var first_line = true;
             var res: usize = std.math.maxInt(usize);
-            var it = mem.tokenize(u8, description, "\n");
+            var it = mem.tokenizeScalar(u8, description, '\n');
             while (it.next()) |line| : (first_line = false) {
                 const trimmed = mem.trimLeft(u8, line, " ");
                 const indent = line.len - trimmed.len;
@@ -1188,7 +1219,7 @@ pub fn help(
         };
 
         const description = param.id.description();
-        var it = mem.split(u8, description, "\n");
+        var it = mem.splitScalar(u8, description, '\n');
         var first_line = true;
         var non_emitted_newlines: usize = 0;
         var last_line_indentation: usize = 0;
@@ -1230,12 +1261,11 @@ pub fn help(
             } else {
                 // For none markdown like format, we just respect the newlines in the input
                 // string and output them as is.
-                var i: usize = 0;
-                while (i < non_emitted_newlines) : (i += 1)
+                for (0..non_emitted_newlines) |_|
                     try description_writer.newline();
             }
 
-            var words = mem.tokenize(u8, line, " ");
+            var words = mem.tokenizeScalar(u8, line, ' ');
             while (words.next()) |word|
                 try description_writer.writeWord(word);
 
@@ -1262,7 +1292,7 @@ fn DescriptionWriter(comptime UnderlyingWriter: type) type {
             debug.assert(word.len != 0);
 
             var first_word = writer.printed_chars <= writer.indentation;
-            const chars_to_write = word.len + @intFromBool(!first_word);
+            const chars_to_write = try std.unicode.utf8CountCodepoints(word) + @intFromBool(!first_word);
             if (chars_to_write + writer.printed_chars > writer.max_width) {
                 // If the word does not fit on this line, then we insert a new line and print
                 // it on that line. The only exception to this is if this was the first word.
@@ -1714,6 +1744,50 @@ test "clap.help" {
         \\-d, --dd <V3>...    Both repeated option.
         \\
     );
+
+    // Test with multibyte characters.
+    try testHelp(.{
+        .indent = 0,
+        .max_width = 46,
+        .description_on_new_line = false,
+        .description_indent = 4,
+        .spacing_between_parameters = 2,
+    },
+        \\-a                  Shört flåg.
+        \\
+        \\
+        \\-b <V1>             Shört öptiön.
+        \\
+        \\
+        \\    --aa            Löng fläg.
+        \\
+        \\
+        \\    --bb <V2>       Löng öptiön.
+        \\
+        \\
+        \\-c, --cc            Bóth fläg.
+        \\
+        \\
+        \\    --complicate    Fläg wíth ä cömplǐcätéd
+        \\                    änd vërý löng dèscrıptıön
+        \\                    thät späns mültíplë
+        \\                    lınēs.
+        \\
+        \\                    Pärägräph number 2:
+        \\                    * Bullet pöint
+        \\                    * Bullet pöint
+        \\
+        \\                    Exämple:
+        \\                        sömething sömething
+        \\                        sömething
+        \\
+        \\
+        \\-d, --dd <V3>       Böth öptiön.
+        \\
+        \\
+        \\-d, --dd <V3>...    Böth repeäted öptiön.
+        \\
+    );
 }
 
 /// Will print a usage message in the following format:
@@ -1722,18 +1796,18 @@ test "clap.help" {
 /// First all none value taking parameters, which have a short name are printed, then non
 /// positional parameters and finally the positional.
 pub fn usage(stream: anytype, comptime Id: type, params: []const Param(Id)) !void {
-    var cos = io.countingWriter(stream);
+    var cos = ccw.codepointCountingWriter(stream);
     const cs = cos.writer();
     for (params) |param| {
         const name = param.names.short orelse continue;
         if (param.takes_value != .none)
             continue;
 
-        if (cos.bytes_written == 0)
+        if (cos.codepoints_written == 0)
             try stream.writeAll("[-");
         try cs.writeByte(name);
     }
-    if (cos.bytes_written != 0)
+    if (cos.codepoints_written != 0)
         try cs.writeAll("]");
 
     var has_positionals: bool = false;
@@ -1752,7 +1826,7 @@ pub fn usage(stream: anytype, comptime Id: type, params: []const Param(Id)) !voi
             continue;
         };
 
-        if (cos.bytes_written != 0)
+        if (cos.codepoints_written != 0)
             try cs.writeAll(" ");
 
         try cs.writeAll("[");
@@ -1776,7 +1850,7 @@ pub fn usage(stream: anytype, comptime Id: type, params: []const Param(Id)) !voi
         if (param.names.short != null or param.names.long != null)
             continue;
 
-        if (cos.bytes_written != 0)
+        if (cos.codepoints_written != 0)
             try cs.writeAll(" ");
 
         try cs.writeAll("<");
